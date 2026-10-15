@@ -1,0 +1,2 @@
+pydantic==2.14.1
+pywin32==312; sys_platform == "win32"
