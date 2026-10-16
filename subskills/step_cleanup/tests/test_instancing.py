@@ -25,7 +25,7 @@ class InstancingTests(unittest.TestCase):
 	def testMandatoryInstancingPreservesColorAndPlacement(self) -> None:
 		import cadquery as cq
 		from modules.cad_geometry import CadModel
-		from modules.instancing_audit import compareInventories, worldInventory, worldSolids
+		from modules.instancing_audit import checkSharedReferences, compareInventories, worldInventory, worldSolids
 		from modules.instancing_plan import InstancingPlanner
 		from modules.step_graph import StepGraph
 
@@ -61,7 +61,8 @@ class InstancingTests(unittest.TestCase):
 			output = work / "cleaned.step"
 			report = runCleanup(source, output, 0.0, (), False)
 			instancing = report["deduplication"]
-			self.assertEqual(instancing["mapped_instances_created"], 1)
+			self.assertEqual(instancing["shared_instances_created"], 1)
+			self.assertEqual(instancing["mapped_instances_created"], 0)
 			self.assertEqual(instancing["stored_solids_before"], 3)
 			self.assertEqual(instancing["stored_solids_after"], 2)
 			self.assertEqual(instancing["physical_solids"], 3)
@@ -74,12 +75,52 @@ class InstancingTests(unittest.TestCase):
 			self.assertLess(output.stat().st_size, len(source_bytes))
 			original_graph = StepGraph(source)
 			final_graph = StepGraph(output)
+			checkSharedReferences(original_graph, final_graph, instancing["aliases"], instancing["assembly"])
 			for entity_id, value in original_graph.entities.items():
 				if value.startswith(("PRODUCT(", "PRODUCT_DEFINITION(", "NEXT_ASSEMBLY_USAGE_OCCURRENCE(", "ITEM_DEFINED_TRANSFORMATION(")):
 					self.assertEqual(final_graph.entities[entity_id], value)
-			with self.assertRaisesRegex(ValueError, "already contains mapped geometry"):
+				if value.startswith("SHAPE_DEFINITION_REPRESENTATION("):
+					self.assertEqual(final_graph.entities[entity_id], value)
+			occurrence = instancing["assembly"]["occurrences"][0]["occurrence"]
+			final_graph.entities[occurrence] = "NEXT_ASSEMBLY_USAGE_OCCURRENCE('missing','missing','',#1,#1,$)"
+			with self.assertRaisesRegex(ValueError, "Missing shared occurrence"):
+				checkSharedReferences(original_graph, final_graph, instancing["aliases"], instancing["assembly"])
+			self.assertFalse(any(value.startswith("MAPPED_ITEM(") for value in StepGraph(output).entities.values()))
+			with self.assertRaisesRegex(ValueError, "already contains mapped or assembly-instanced geometry"):
 				runDeduplication(output, work / "twice.step")
 			self.assertFalse((work / "twice.step").exists())
+
+	def testRepeatedPinsKeepEveryUseAndShareOneDefinition(self) -> None:
+		import cadquery as cq
+		from modules.cad_geometry import CadModel
+		from modules.instancing_audit import compareInventories, worldInventory, worldSolids
+		from modules.step_graph import StepGraph, references
+
+		with tempfile.TemporaryDirectory() as temporary:
+			work = Path(temporary)
+			pin = cq.Workplane("XY").box(1, 2, 3).val()
+			package = cq.Compound.makeCompound([pin.translate((offset, 0, 0)) for offset in (0, 5, 10)])
+			assembly = cq.Assembly(name="RepeatedPins")
+			assembly.add(package, name="Package_A", color=cq.Color(0.3, 0.5, 0.7))
+			assembly.add(package, name="Package_A_placed", loc=cq.Location((30, 10, 5)), color=cq.Color(0.3, 0.5, 0.7))
+			source = work / "pins.step"
+			assembly.export(str(source))
+			before = worldInventory(CadModel(source))
+			output = work / "instanced.step"
+			report = runDeduplication(source, output)
+			self.assertGreaterEqual(report["shared_instances_created"], 2)
+			self.assertTrue(report["shared_reference_checks_passed"])
+			self.assertEqual(report["physical_solids"], 6)
+			final = CadModel(output, internal_labels=True)
+			compareInventories(before, worldInventory(final))
+			solids = worldSolids(final)
+			self.assertEqual(len(solids), 6)
+			self.assertTrue(all(solids[0].wrapped.IsPartner(solid.wrapped) for solid in solids))
+			graph = StepGraph(output)
+			definitions = {record["prototype_definition"] for record in report["assembly"]["occurrences"]}
+			self.assertEqual(len(definitions), 1)
+			self.assertEqual(len(report["assembly"]["occurrences"]), 3)
+			self.assertEqual(sum(value.startswith("MANIFOLD_SOLID_BREP(") for value in graph.entities.values()), 1)
 
 	def testNoMatchesIsSuccessfulAndDoesNotGrow(self) -> None:
 		import cadquery as cq
@@ -91,7 +132,7 @@ class InstancingTests(unittest.TestCase):
 			digest = hashlib.sha256(source.read_bytes()).hexdigest()
 			output = work / "checked.step"
 			report = runDeduplication(source, output)
-			self.assertEqual(report["mapped_instances_created"], 0)
+			self.assertEqual(report["shared_instances_created"], 0)
 			self.assertEqual(report["stored_solids_before"], report["stored_solids_after"])
 			self.assertEqual(hashlib.sha256(output.read_bytes()).hexdigest(), digest)
 			with self.assertRaisesRegex(ValueError, "new output path"):

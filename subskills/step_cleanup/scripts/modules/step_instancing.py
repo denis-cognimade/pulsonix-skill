@@ -5,8 +5,8 @@ import shutil
 from pathlib import Path
 
 from .cad_geometry import CadModel, boundsKey
-from .instancing_audit import cadTransform, compareInventories, digest, rigidTransform, uniqueGeometry, worldInventory, worldSolids
-from .instancing_graph import MappedInstancing
+from .instancing_audit import cadTransform, checkSharedReferences, compareInventories, digest, rigidTransform, uniqueGeometry, worldInventory, worldSolids
+from .instancing_graph import AssemblyInstancing
 from .instancing_plan import InstancingPlanner
 from .step_graph import StepGraph
 
@@ -19,8 +19,9 @@ def deduplicateCandidate(source: Path, candidate: Path) -> dict:
 		raise ValueError("Instancing candidate must be a new path distinct from its source")
 	source_digest = digest(source)
 	graph = StepGraph(source)
-	if any(value.startswith("MAPPED_ITEM(") for value in graph.entities.values()):
-		raise ValueError("Input already contains mapped geometry; use the original direct-BRep export for this helper")
+	graph.checkSupported()
+	if any(value.startswith(("MAPPED_ITEM(", "PRODUCT('__STEP_SHARED_")) for value in graph.entities.values()):
+		raise ValueError("Input already contains mapped or assembly-instanced geometry; use the original direct-BRep export for this helper")
 	plan = InstancingPlanner(graph).plan()
 	model = CadModel(source)
 	logger.info("Auditing source geometry and inherited face appearances")
@@ -46,7 +47,7 @@ def deduplicateCandidate(source: Path, candidate: Path) -> dict:
 		return shape
 
 	if plan["shared_groups"]:
-		instancer = MappedInstancing(graph)
+		instancer = AssemblyInstancing(graph)
 		for group in plan["shared_groups"]:
 			canonical = min(group, key=lambda item: item["root"])
 			canonical_shape = sourceSolid(canonical)
@@ -62,19 +63,22 @@ def deduplicateCandidate(source: Path, candidate: Path) -> dict:
 				extra = placed.cut(original).Volume()
 				if missing > 1e-6 or extra > 1e-6:
 					raise ValueError(f"Geometry mismatch for #{duplicate['root']}: missing={missing}, extra={extra}")
-				instancer.instance(duplicate["root"], canonical["root"], rotation, translation)
 				aliases.append({"root": duplicate["root"], "component": duplicate["name"],
 					"prototype": canonical["root"], "prototype_component": canonical["name"],
 					"rotation": rotation, "translation": translation,
 					"missing_volume_mm3": missing, "extra_volume_mm3": extra})
 				if len(aliases) % 25 == 0:
 					logger.info("Verified and instanced %d / %d duplicate solids", len(aliases), plan["solid_definitions"] - plan["prototype_count"])
+		assembly = instancer.apply(aliases)
 		compaction = graph.prune(())
 		graph.write(candidate)
 	else:
 		# A mandatory stage can validly find no matches. Preserve the file exactly.
 		compaction = {"discarded_records": 0}
+		assembly = {"occurrences": [], "prototypes": 0}
 		shutil.copy2(source, candidate)
+	final_graph = StepGraph(candidate)
+	checkSharedReferences(StepGraph(source), final_graph, aliases, assembly)
 	logger.info("Reopening instanced candidate to check geometry, colors, and sharing")
 	final_model = CadModel(candidate, internal_labels=True)
 	after = worldInventory(final_model)
@@ -84,9 +88,8 @@ def deduplicateCandidate(source: Path, candidate: Path) -> dict:
 		raise ValueError("CAD reader did not actually share the mapped geometry")
 	if not aliases and geometry_count != source_geometry_count:
 		raise ValueError("Stored geometry count changed without a mapped replacement")
-	final_graph = StepGraph(candidate)
 	for entity_id, value in graph.original_entities.items():
-		if value.startswith(("PRODUCT(", "PRODUCT_DEFINITION(", "NEXT_ASSEMBLY_USAGE_OCCURRENCE(", "ITEM_DEFINED_TRANSFORMATION(")):
+		if value.startswith(("PRODUCT(", "PRODUCT_DEFINITION(", "SHAPE_DEFINITION_REPRESENTATION(", "NEXT_ASSEMBLY_USAGE_OCCURRENCE(", "ITEM_DEFINED_TRANSFORMATION(")):
 			if final_graph.entities.get(entity_id) != value:
 				raise ValueError(f"Product/placement metadata changed at #{entity_id}")
 	if digest(source) != source_digest or candidate.stat().st_size > source.stat().st_size:
@@ -95,11 +98,13 @@ def deduplicateCandidate(source: Path, candidate: Path) -> dict:
 		"input_bytes": source.stat().st_size, "output_bytes": candidate.stat().st_size,
 		"solid_definitions_analyzed": plan["solid_definitions"], "shared_groups": len(plan["shared_groups"]),
 		"stored_solids_before": source_geometry_count, "stored_solids_after": geometry_count,
-		"mapped_instances_created": len(aliases), "named_assembly_roots": len(after),
+		"mapped_instances_created": 0, "shared_instances_created": len(aliases),
+		"instancing_method": "assembly_occurrences", "assembly": assembly, "named_assembly_roots": len(after),
 		"physical_solids": sum(record["solids"] for record in after.values()),
 		"all_geometry_checks_passed": True, "face_appearance_checks_passed": True,
+		"shared_reference_checks_passed": True,
 		"product_and_placement_metadata_preserved": True, "compaction": compaction,
 		"aliases": aliases, "application_validation": "not performed by helper"}
-	logger.info("Instancing passed: %d -> %d stored geometries, %d mapped instances, %d -> %d bytes",
+	logger.info("Instancing passed: %d -> %d stored geometries, %d shared instances, %d -> %d bytes",
 		source_geometry_count, geometry_count, len(aliases), report["input_bytes"], report["output_bytes"])
 	return report

@@ -35,7 +35,7 @@ def runDeduplication(source: Path, output: Path) -> dict:
 
 def main() -> int:
 	parser = argparse.ArgumentParser(description="Deduplicate cleaned STEP solids with shared geometry, preserving products, placements, and appearance.")
-	parser.add_argument("--version", action="version", version="step_deduplicate 1.0.0")
+	parser.add_argument("--version", action="version", version="step_deduplicate 1.1.0")
 	parser.add_argument("source", type=Path, help="Cleaned direct-BRep .stp or .step input")
 	parser.add_argument("--output", type=Path, help="New output path; default SOURCE_instanced.stp")
 	args = parser.parse_args()

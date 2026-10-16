@@ -7,6 +7,7 @@ from pathlib import Path
 ENTITY_PATTERN = re.compile(r"#(\d+)\s*=\s*((?:'(?:[^']|'')*'|[^;'])*);", re.DOTALL)
 TOKEN_PATTERN = re.compile(r"'(?:[^']|'')*'|#(\d+)")
 PRESENTATION_TYPE = "MECHANICAL_DESIGN_GEOMETRIC_PRESENTATION_REPRESENTATION"
+SOLID_PREFIXES = ("MANIFOLD_SOLID_BREP(", "BREP_WITH_VOIDS(")
 # Unknown record families may carry semantic roots and must not silently disappear.
 KNOWN_TYPES = set("""APPLICATION_PROTOCOL_DEFINITION APPLICATION_CONTEXT
 SHAPE_DEFINITION_REPRESENTATION PRODUCT_DEFINITION_SHAPE PRODUCT_DEFINITION
@@ -14,10 +15,10 @@ PRODUCT_DEFINITION_FORMATION PRODUCT PRODUCT_CONTEXT PRODUCT_DEFINITION_CONTEXT
 SHAPE_REPRESENTATION ADVANCED_BREP_SHAPE_REPRESENTATION PRODUCT_RELATED_PRODUCT_CATEGORY
 CONTEXT_DEPENDENT_SHAPE_REPRESENTATION ITEM_DEFINED_TRANSFORMATION NEXT_ASSEMBLY_USAGE_OCCURRENCE
 AXIS2_PLACEMENT_3D AXIS2_PLACEMENT_2D AXIS1_PLACEMENT CARTESIAN_POINT DIRECTION
-UNCERTAINTY_MEASURE_WITH_UNIT MANIFOLD_SOLID_BREP CLOSED_SHELL ADVANCED_FACE FACE_BOUND
+UNCERTAINTY_MEASURE_WITH_UNIT MANIFOLD_SOLID_BREP BREP_WITH_VOIDS CLOSED_SHELL ORIENTED_CLOSED_SHELL ADVANCED_FACE FACE_BOUND
 FACE_OUTER_BOUND EDGE_LOOP ORIENTED_EDGE EDGE_CURVE VERTEX_POINT LINE VECTOR PLANE
 ELLIPSE CYLINDRICAL_SURFACE CIRCLE SPHERICAL_SURFACE B_SPLINE_CURVE_WITH_KNOTS
-CONICAL_SURFACE TOROIDAL_SURFACE B_SPLINE_SURFACE_WITH_KNOTS SURFACE_OF_REVOLUTION
+CONICAL_SURFACE TOROIDAL_SURFACE B_SPLINE_SURFACE_WITH_KNOTS SURFACE_OF_REVOLUTION SURFACE_OF_LINEAR_EXTRUSION
 MECHANICAL_DESIGN_GEOMETRIC_PRESENTATION_REPRESENTATION STYLED_ITEM
 PRESENTATION_STYLE_ASSIGNMENT SURFACE_STYLE_USAGE SURFACE_SIDE_STYLE SURFACE_STYLE_FILL_AREA
 FILL_AREA_STYLE FILL_AREA_STYLE_COLOUR COLOUR_RGB CURVE_STYLE DRAUGHTING_PRE_DEFINED_CURVE_FONT
@@ -55,6 +56,27 @@ class StepGraph:
 			if missing:
 				raise ValueError(f"Dangling references in #{entity_id}: {sorted(missing)}")
 
+	def schemaInventory(self) -> dict:
+		"""Inspect unfamiliar records without permitting graph edits or importing CAD."""
+		families = collections.defaultdict(list)
+		for entity_id, value in self.entities.items():
+			families[value.split("(", 1)[0].strip() or "<complex>"].append(entity_id)
+		unknown = set(families) - KNOWN_TYPES - {"<complex>"}
+		incoming = collections.defaultdict(list)
+		for entity_id, value in self.entities.items():
+			for target in references(value):
+				incoming[target].append(entity_id)
+		return {"entity_count": len(self.entities), "unsupported_families": sorted(unknown),
+			"families": {family: {"count": len(ids), "samples": [
+				{"id": entity_id, "record": self.entities[entity_id],
+					"references": references(self.entities[entity_id]), "referenced_by": incoming[entity_id]}
+				for entity_id in ids[:3]]} for family, ids in sorted(families.items())}}
+
+	def checkSupported(self) -> None:
+		unknown = {value.split("(", 1)[0].strip() for value in self.entities.values()} - KNOWN_TYPES - {""}
+		if unknown:
+			raise ValueError(f"Unsupported STEP record families; run --inspect-schema and follow references/schema-extension.md: {sorted(unknown)}")
+
 	def closure(self, roots: set[int]) -> set[int]:
 		visited = set()
 		pending = list(roots)
@@ -91,7 +113,7 @@ class StepGraph:
 				continue
 			definition_shape, representation = references(value)
 			definition = references(self.entities[definition_shape])[-1]
-			solids = [item for item in references(self.entities[representation]) if self.entities[item].startswith("MANIFOLD_SOLID_BREP(")]
+			solids = [item for item in references(self.entities[representation]) if self.entities[item].startswith(SOLID_PREFIXES)]
 			if solids:
 				name = names[definition]
 				if name in products:
@@ -129,9 +151,7 @@ class StepGraph:
 			self.entities[mapping[entity_id]] = remapReferences(donor.entities[entity_id], mapping)
 
 	def prune(self, prefixes: tuple[str, ...]) -> dict:
-		unknown = {value.split("(", 1)[0].strip() for value in self.entities.values()} - KNOWN_TYPES - {""}
-		if unknown:
-			raise ValueError(f"Unsupported STEP record families; inspect semantic roots before editing: {sorted(unknown)}")
+		self.checkSupported()
 		names, product_ids = self.definitions()
 		targets = {entity_id for entity_id, name in names.items() if prefixes and name.startswith(prefixes)}
 		occurrences = {entity_id: references(value) for entity_id, value in self.entities.items() if value.startswith("NEXT_ASSEMBLY_USAGE_OCCURRENCE(")}

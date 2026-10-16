@@ -4,6 +4,7 @@ import collections
 import logging
 import math
 from pathlib import Path
+from typing import Callable
 
 import cadquery as cq
 from OCP.BRepAdaptor import BRepAdaptor_Surface
@@ -14,7 +15,7 @@ from OCP.STEPCAFControl import STEPCAFControl_Reader
 from OCP.StepToTopoDS import StepToTopoDS_Builder
 from OCP.TCollection import TCollection_ExtendedString
 from OCP.TDataStd import TDataStd_Name
-from OCP.TDF import TDF_Label, TDF_LabelSequence
+from OCP.TDF import TDF_AttributeIterator, TDF_Label, TDF_LabelSequence
 from OCP.TDocStd import TDocStd_Document
 from OCP.XCAFApp import XCAFApp_Application
 from OCP.XCAFDoc import XCAFDoc_DocumentTool
@@ -126,8 +127,15 @@ class CadModel:
 
 	@staticmethod
 	def labelName(label: object) -> str:
-		attribute = TDataStd_Name()
-		return attribute.Get().ToExtString() if label.FindAttribute(TDataStd_Name.GetID_s(), attribute) else ""
+		# Mapped prototypes may have no name. Avoid FindAttribute's output
+		# handle overload: an absent attribute can crash the Python binding.
+		attributes = TDF_AttributeIterator(label)
+		while attributes.More():
+			attribute = attributes.Value()
+			if isinstance(attribute, TDataStd_Name):
+				return attribute.Get().ToExtString()
+			attributes.Next()
+		return ""
 
 	def entityShape(self, entity_id: int) -> cq.Shape:
 		reader = self.reader.Reader()
@@ -178,6 +186,20 @@ class CadModel:
 		return counts
 
 
+class HoleRemovalError(ValueError):
+	"""Carry rejected geometry until the caller has saved diagnostic evidence."""
+	def __init__(self, message: str, original: cq.Shape, candidate: cq.Shape | None, details: dict) -> None:
+		super().__init__(message)
+		self.original = original
+		self.candidate = candidate
+		self.details = details
+
+
+def describeBores(groups: list[list[dict]]) -> list[dict]:
+	return [{"key": holeKeys([group])[0], "diameter_mm": group[0]["diameter"],
+		"faces": group} for group in groups]
+
+
 class HoleRemover:
 	def __init__(self, diameter: float) -> None:
 		self.diameter = diameter
@@ -214,39 +236,105 @@ class HoleRemover:
 			raise ValueError("Flat-board reconstruction changed more than the selected hole volumes")
 		return edited
 
+	def selectedFaces(self, original: cq.Shape, groups: list[list[dict]]) -> set[int]:
+		faces = original.Faces()
+		selected = {bore["face_index"] for group in groups for bore in group}
+		wall_edges = [edge for index in selected for edge in faces[index].Edges()]
+		maximum_area = max(math.pi * (group[0]["diameter"] / 2) ** 2 for group in groups)
+		for index, face in enumerate(faces):
+			if index not in selected and face.geomType() == "PLANE" and face.Area() <= maximum_area + 1e-6:
+				edges = face.Edges()
+				if edges and all(any(edge.wrapped.IsSame(wall.wrapped) for wall in wall_edges) for edge in edges):
+					selected.add(index)
+		return selected
+
+	def defeature(self, original: cq.Shape, selected: set[int]) -> tuple[cq.Shape, dict]:
+		faces = original.Faces()
+		operation = BRepAlgoAPI_Defeaturing()
+		operation.SetShape(original.wrapped)
+		operation.SetRunParallel(True)
+		for index in sorted(selected):
+			operation.AddFaceToRemove(faces[index].wrapped)
+		operation.Build()
+		if not operation.IsDone():
+			raise ValueError("Hole defeaturing failed (IsDone=False)")
+		# CadQuery's pinned OCP binding does not expose every C++ report method.
+		warning_reader = getattr(operation, "HasWarnings", None)
+		return cq.Shape.cast(operation.Shape()), {"is_done": True,
+			"has_warnings": warning_reader() if warning_reader is not None else None,
+			"warning_api_available": warning_reader is not None}
+
+	def checkResult(self, original: cq.Shape, edited: cq.Shape, require_all: bool = True) -> dict:
+		checks = {}
+		result = {"checks": checks, "check_errors": {}}
+		def check(name: str, action: Callable[[], bool]) -> None:
+			try:
+				checks[name] = action()
+			except Exception as error:
+				checks[name] = None
+				result["check_errors"][name] = str(error)
+		def remainingBores() -> bool:
+			remaining = completeGroups(boreFaces(edited, self.diameter))
+			result["remaining_bores"] = describeBores(remaining)
+			return not remaining
+		def protected(shape: cq.Shape) -> list[tuple]:
+			return holeKeys(completeGroups([bore for bore in boreFaces(shape) if bore["diameter"] >= self.diameter - DIAMETER_EPSILON_MM]))
+		def protectedUnchanged() -> bool:
+			result["protected_before"] = protected(original)
+			result["protected_after"] = protected(edited)
+			return result["protected_before"] == result["protected_after"]
+		def materialPreserved() -> bool:
+			if checks["valid"] is not True:
+				raise ValueError("Material comparison not evaluated for invalid or unverified geometry")
+			result["removed_volume_mm3"] = original.cut(edited).Volume()
+			result["added_volume_mm3"] = edited.Volume() - original.Volume()
+			return math.isfinite(result["removed_volume_mm3"]) and result["removed_volume_mm3"] <= 1e-5
+		check("valid", edited.isValid)
+		check("solid_count_unchanged", lambda: len(edited.Solids()) == len(original.Solids()))
+		check("selected_bores_absent", remainingBores)
+		check("bounds_unchanged", lambda: boundsKey(original) == boundsKey(edited))
+		check("protected_holes_unchanged", protectedUnchanged)
+		check("original_material_preserved", materialPreserved)
+		result["accepted"] = all(value is True for key, value in checks.items() if require_all or key != "selected_bores_absent")
+		return result
+
 	def edit(self, original: cq.Shape) -> tuple[cq.Shape, int]:
+		solids = original.Solids()
+		if len(solids) > 1:
+			# A package's touching/overlapping solids are separate bodies, not a
+			# Boolean union. Compound defeaturing can leave a bore untouched.
+			edited_solids = []
+			count = 0
+			for index, solid in enumerate(solids):
+				logger.info("Checking solid %d / %d for small holes", index + 1, len(solids))
+				edited_solid, removed = self.edit(solid)
+				edited_solids.append(edited_solid)
+				count += removed
+			if not count:
+				return original, 0
+			edited = cq.Compound.makeCompound(edited_solids)
+			details = self.checkResult(original, edited)
+			if not details["accepted"]:
+				raise HoleRemovalError("Per-solid hole removal failed assembly checks", original, edited, details)
+			return edited, count
 		groups = completeGroups(boreFaces(original, self.diameter))
 		if not groups:
 			return original, 0
-		edited = self.flatBoard(original, groups)
-		if edited is None:
-			faces = original.Faces()
-			selected = {bore["face_index"] for group in groups for bore in group}
-			wall_edges = [edge for index in selected for edge in faces[index].Edges()]
-			maximum_area = max(math.pi * (group[0]["diameter"] / 2) ** 2 for group in groups)
-			for index, face in enumerate(faces):
-				if index not in selected and face.geomType() == "PLANE" and face.Area() <= maximum_area + 1e-6:
-					edges = face.Edges()
-					if edges and all(any(edge.wrapped.IsSame(wall.wrapped) for wall in wall_edges) for edge in edges):
-						selected.add(index)
-			operation = BRepAlgoAPI_Defeaturing()
-			operation.SetShape(original.wrapped)
-			operation.SetRunParallel(True)
-			for index in sorted(selected):
-				operation.AddFaceToRemove(faces[index].wrapped)
-			operation.Build()
-			if not operation.IsDone():
-				raise ValueError("Hole defeaturing failed")
-			edited = cq.Shape.cast(operation.Shape())
-		if not edited.isValid() or len(edited.Solids()) != len(original.Solids()) or completeGroups(boreFaces(edited, self.diameter)):
-			raise ValueError("Hole removal left invalid geometry, changed solid count, or missed holes")
-		if boundsKey(original) != boundsKey(edited):
-			raise ValueError("Hole removal changed the outer bounds")
-		def protected(shape: cq.Shape) -> list[tuple]:
-			return holeKeys(completeGroups([bore for bore in boreFaces(shape) if bore["diameter"] >= self.diameter - DIAMETER_EPSILON_MM]))
-		before_holes = protected(original)
-		after_holes = protected(edited)
-		removed_volume = original.cut(edited).Volume()
-		if before_holes != after_holes or removed_volume > 1e-5:
-			raise ValueError(f"Hole removal changed protected holes or removed existing material: before={before_holes}, after={after_holes}, removed_mm3={removed_volume}")
+		edited = None
+		details = {"diameter_limit_mm": self.diameter, "selected_bores": describeBores(groups),
+			"face_index_basis": "zero-based Faces() on each saved shape; indices are not STEP entity IDs"}
+		try:
+			selected = self.selectedFaces(original, groups)
+			details["selected_face_indices"] = sorted(selected)
+			edited = self.flatBoard(original, groups)
+			details["method"] = "flat_board" if edited is not None else "defeaturing"
+			if edited is None:
+				edited, details["operation"] = self.defeature(original, selected)
+			details.update(self.checkResult(original, edited))
+			if not details["accepted"]:
+				failed = [key for key, passed in details["checks"].items() if not passed]
+				diameters = [bore["diameter_mm"] for bore in details.get("remaining_bores", [])]
+				raise ValueError(f"Hole removal rejected: {failed}; remaining bore diameters mm={diameters}")
+		except Exception as error:
+			raise HoleRemovalError(str(error), original, edited, details) from error
 		return edited, len(groups)

@@ -28,11 +28,11 @@ For the tested independent-wrapper layout:
 5. Filter the item lists in geometric presentation representations to live styles. Preserve retained style chains and contexts. Old styles must not pull deleted geometry back into the reachable graph.
 6. Walk the final semantic and appearance roots and remove every unreachable record. Check that every unselected occurrence remains and no removed product is revived through metadata.
 
-Do not generalize the helper's root allowlist to unknown STEP schemas without inspection. Materials, PMI, layers, or additional application metadata can require extra semantic roots. A parser success alone does not justify dropping unfamiliar records.
+Do not generalize the helper's root allowlist to unknown STEP schemas without inspection. Materials, PMI, layers, or additional application metadata can require extra semantic roots. A parser success alone does not justify dropping unfamiliar records. Use `--inspect-schema` and follow [the schema-extension procedure](schema-extension.md) for classification, adapter criteria and regression evidence. The implemented void-solid extension recognizes both `MANIFOLD_SOLID_BREP` and its `BREP_WITH_VOIDS` subtype as direct solid roots; their inner shells and extrusion surfaces are preserved through the dependency graph.
 
 ## Replace solids and remove the old geometry
 
-For each edited part, map original and donor manifold solid roots with explicit CAD evidence. Allocate fresh IDs for the donor's dependent geometry, remap its references, and replace the original solid-root definitions. Other records keep their contents and IDs.
+For each edited part, map only its changed original and donor manifold solid roots (including solids with voids) with explicit CAD evidence. Allocate fresh IDs for the donor's dependent geometry, remap its references, and replace those original solid-root definitions. Untouched bodies, including pins, retain their native records and styles. For the guarded native cylindrical-hole recovery, edit only the proven shell/face boundary lists as described in [the geometry method](geometry.md#native-recovery-for-isolated-cylindrical-cavities).
 
 **This intermediate patch is not the deliverable.** It still contains old shells, faces, edges, curves, and points that were used by the replaced roots. Prune from active geometry and appearance roots before publishing. Merely appending replacement records makes the file larger even when the visible part is simpler.
 

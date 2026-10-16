@@ -13,12 +13,54 @@ from OCP.gp import gp_Trsf
 
 from .cad_geometry import CadModel, boundsKey
 from .instancing_plan import multiply
+from .step_graph import SOLID_PREFIXES, StepGraph, references
 
 logger = logging.getLogger(__name__)
 
 
 def digest(path: Path) -> str:
 	return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def checkSharedReferences(original: StepGraph, final: StepGraph, aliases: list[dict], assembly: dict) -> None:
+	"""Prove each original solid use survives as a child of its original product."""
+	final.checkReferences()
+	by_root = {alias["root"]: alias["prototype"] for alias in aliases}
+	seen = set()
+	prototype_definitions = {}
+	affected = set(by_root) | set(by_root.values())
+	owners = {entity_id for entity_id, value in original.entities.items()
+		if value.startswith(("SHAPE_REPRESENTATION(", "ADVANCED_BREP_SHAPE_REPRESENTATION("))
+		and affected.intersection(references(value)[:-1])}
+	expected = {(owner, item) for owner in owners for item in references(original.entities[owner])[:-1]
+		if original.entities[item].startswith(SOLID_PREFIXES)}
+	for record in assembly["occurrences"]:
+		root = record["source_root"]
+		canonical = by_root.get(root, root)
+		owner = record["parent_representation"]
+		key = (owner, root)
+		if key in seen or key not in expected or record["prototype"] != canonical:
+			raise ValueError(f"Incorrect or repeated shared solid use #{root}")
+		seen.add(key)
+		occurrence = final.entities.get(record["occurrence"], "")
+		if not occurrence.startswith("NEXT_ASSEMBLY_USAGE_OCCURRENCE(") or references(occurrence) != [record["parent_definition"], record["prototype_definition"]]:
+			raise ValueError(f"Missing shared occurrence for solid #{root}")
+		prototype = final.entities[record["prototype_representation"]]
+		if not prototype.startswith("ADVANCED_BREP_SHAPE_REPRESENTATION(") or canonical not in references(prototype)[:-1]:
+			raise ValueError(f"Incorrect shared prototype for solid #{root}")
+		if final.entities.get(canonical) != original.entities[canonical]:
+			raise ValueError(f"Shared native solid #{canonical} changed")
+		definition = record["prototype_definition"]
+		if canonical in prototype_definitions and prototype_definitions[canonical] != definition:
+			raise ValueError(f"Solid #{canonical} does not use one shared product definition")
+		prototype_definitions[canonical] = definition
+		if record["placement"] not in references(final.entities[owner])[:-1]:
+			raise ValueError(f"Missing placement for shared solid #{root}")
+		transform = final.entities.get(record["transformation"], "")
+		if not transform.startswith("ITEM_DEFINED_TRANSFORMATION(") or references(transform)[-1] != record["placement"]:
+			raise ValueError(f"Missing transformation for shared solid #{root}")
+	if seen != expected:
+		raise ValueError("Original solid uses disappeared during assembly instancing")
 
 
 def rigidTransform(canonical: dict, duplicate: dict) -> tuple[list, list]:
